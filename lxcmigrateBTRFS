@@ -1,3 +1,42 @@
+#!/bin/bash
+
+# LXC container migration script between servers.
+# The connection is made from the server hosting the running containers (source server)
+# to the destination server, where the containers will be migrated.
+#
+# FUNCTIONALITY:
+# 1. Stops the container on the source server.
+# 2. Connects to the destination server and prepares the directory structure and Btrfs volume.
+# 3. Transfers the container's config and rootfs directly to the Btrfs volume.
+# 4. Verifies that the transferred data matches in size using a checksum.
+# 5. Retransfers the rootfs if checksum verification fails.
+# 6. Cleans up temporary data on the destination server.
+#
+# USAGE:
+#   $0 <destination_ip> <container_file> [-f] [--exclude exclude_file]
+# Where:
+#   - <destination_ip>: IP or hostname of the destination server.
+#   - <container_file>: File containing the container names, one per line.
+#   - -f: Optional flag to continue even if the container is already stopped.
+#   - --exclude: Optional file listing directories to exclude during rsync.
+
+# Configurable variables
+DESTINO_SERVIDOR="$1"
+FICHERO_CONTENEDORES="$2"
+FORCE_CONTINUE=false
+EXCLUDE_FILE=""
+
+for arg in "$@"; do
+    if [[ "$arg" == "-f" ]]; then
+        FORCE_CONTINUE=true
+    elif [[ "$arg" == "--exclude" ]]; then
+        EXCLUDE_FILE="${!OPTIND}"; shift
+    fi
+done
+
+LLAVE_SSH="~/.ssh/id_rsa" # Update with the correct SSH key path
+CONEXION_SSH="ssh -i $LLAVE_SSH $DESTINO_SERVIDOR"
+
 # Show help if requested
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
     echo "Usage: $0 <destination_ip> <container_file> [-f] [--exclude exclude_file]"
@@ -49,70 +88,42 @@ while read -r CONTENEDOR; do
         fi
     fi
 
-    echo "Connecting to the destination server and transferring the container..."
-    rsync -avhH --progress --numeric-ids $EXCLUDE_OPTIONS -e "ssh -i $LLAVE_SSH" "/var/lib/lxc/$CONTENEDOR" "$DESTINO_SERVIDOR:/tmp/" || {
-        echo "Error: Failed to transfer container $CONTENEDOR to the destination server." >&2
+    # Prepare the destination server
+    echo "Preparing the destination server for container $CONTENEDOR..."
+    $CONEXION_SSH "sudo mkdir -p /var/lib/lxc/$CONTENEDOR && sudo btrfs subvolume create /var/lib/lxc/$CONTENEDOR/rootfs" || {
+        echo "Error: Failed to prepare the destination server for container $CONTENEDOR." >&2
         continue
     }
 
+    # Transfer the container config
+    echo "Transferring container config..."
+    scp -i "$LLAVE_SSH" "/var/lib/lxc/$CONTENEDOR/config" "$DESTINO_SERVIDOR:/var/lib/lxc/$CONTENEDOR/" || {
+        echo "Error: Failed to transfer config for container $CONTENEDOR." >&2
+        continue
+    }
+
+    # Transfer the rootfs directly to the Btrfs volume with retransmission logic
     while true; do
-        # Calculate checksum on source
-        ORIGEN_CHECKSUM=$(du -sb "/var/lib/lxc/$CONTENEDOR" | awk '{print $1}')
+        echo "Transferring rootfs directly to the Btrfs volume for container $CONTENEDOR..."
+        rsync -avhH --progress --numeric-ids $EXCLUDE_OPTIONS -e "ssh -i $LLAVE_SSH" "/var/lib/lxc/$CONTENEDOR/rootfs/" "$DESTINO_SERVIDOR:/var/lib/lxc/$CONTENEDOR/rootfs/" || {
+            echo "Error: Failed to transfer rootfs for container $CONTENEDOR." >&2
+            continue
+        }
 
-        # Calculate checksum on destination
-        DESTINO_CHECKSUM=$($CONEXION_SSH "du -sb /tmp/$CONTENEDOR" | awk '{print $1}')
+        echo "Verifying the checksum for container $CONTENEDOR..."
+        ORIGEN_CHECKSUM=$(du -sb "/var/lib/lxc/$CONTENEDOR/rootfs" | awk '{print $1}')
+        DESTINO_CHECKSUM=$($CONEXION_SSH "du -sb /var/lib/lxc/$CONTENEDOR/rootfs" | awk '{print $1}')
 
-        # Verify checksum
         if [[ "$ORIGEN_CHECKSUM" -ne "$DESTINO_CHECKSUM" ]]; then
-            echo "Error: Transferred data for container $CONTENEDOR does not match. Retrying transfer..." >&2
-            $CONEXION_SSH "sudo rm -rf /tmp/$CONTENEDOR" || {
-                echo "Error: Failed to clean up destination folder." >&2
-                break
-            }
-            rsync -avhH --progress --numeric-ids $EXCLUDE_OPTIONS -e "ssh -i $LLAVE_SSH" "/var/lib/lxc/$CONTENEDOR" "$DESTINO_SERVIDOR:/tmp/" || {
-                echo "Error: Failed to retransmit container $CONTENEDOR." >&2
-                break
-            }
+            echo "Checksum mismatch for container $CONTENEDOR. Retrying transfer..." >&2
         else
+            echo "Checksum verified successfully for container $CONTENEDOR."
             break
         fi
     done
-
-    # Ensure the directory exists before creating a Btrfs volume
-    echo "Ensuring directory /var/lib/lxc/$CONTENEDOR exists on the destination server..."
-    $CONEXION_SSH "sudo mkdir -p /var/lib/lxc/$CONTENEDOR" || {
-        echo "Error: Failed to create directory /var/lib/lxc/$CONTENEDOR on the destination server." >&2
-        continue
-    }
-
-    # Create a Btrfs volume on the destination server
-    echo "Creating Btrfs volume for $CONTENEDOR on the destination server..."
-    $CONEXION_SSH "sudo btrfs subvolume create /var/lib/lxc/$CONTENEDOR/rootfs" || {
-        echo "Error: Failed to create Btrfs volume on the destination server." >&2
-        continue
-    }
-
-    # Move content to the Btrfs volume
-    echo "Moving content to the Btrfs volume..."
-    $CONEXION_SSH "sudo rsync -aHAX --numeric-ids /tmp/$CONTENEDOR/rootfs/ /var/lib/lxc/$CONTENEDOR/rootfs/" || {
-        echo "Error: Failed to move content to the Btrfs volume." >&2
-        continue
-    }
-
-    # Ensure the config file is moved
-    echo "Copying container config..."
-    scp -i "$LLAVE_SSH" "$DESTINO_SERVIDOR:/tmp/$CONTENEDOR/config" "$DESTINO_SERVIDOR:/var/lib/lxc/$CONTENEDOR/" || {
-        echo "Error: Failed to copy config file to destination." >&2
-        continue
-    }
-
-    # Clean up the temporary folder
-    $CONEXION_SSH "sudo rm -rf /tmp/$CONTENEDOR/" || {
-        echo "Error: Failed to clean up the temporary folder." >&2
-        continue
-    }
 
     echo "Migration of container $CONTENEDOR completed successfully."
 done < "$FICHERO_CONTENEDORES"
 
 echo "Migration completed for all containers in the file $FICHERO_CONTENEDORES."
+
