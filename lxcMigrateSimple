@@ -1,0 +1,123 @@
+#!/bin/bash
+
+# LXC container migration script between servers.
+# The connection is made from the server hosting the running containers (source server)
+# to the destination server, where the containers will be migrated.
+#
+# FUNCTIONALITY:
+# 1. Stops the container on the source server.
+# 2. Connects to the destination server and transfers the container using rsync.
+# 3. Creates a Btrfs volume on the destination server for the container.
+# 4. Moves the content to the new Btrfs volume.
+# 5. Verifies that the transferred data matches in size using a checksum.
+# 6. Cleans up temporary data on the destination server.
+#
+# USAGE:
+#   $0 <destination_ip> <container_file> [-f] [--exclude exclude_file]
+# Where:
+#   - <destination_ip>: IP or hostname of the destination server.
+#   - <container_file>: File containing the container names, one per line.
+#   - -f: Optional flag to continue even if the container is already stopped.
+#   - --exclude: Optional file listing directories to exclude during rsync.
+
+# Configurable variables
+DESTINO_SERVIDOR="$1"
+FICHERO_CONTENEDORES="$2"
+FORCE_CONTINUE=false
+EXCLUDE_FILE=""
+
+for arg in "$@"; do
+    if [[ "$arg" == "-f" ]]; then
+        FORCE_CONTINUE=true
+    elif [[ "$arg" == "--exclude" ]]; then
+        EXCLUDE_FILE="${!OPTIND}"; shift
+    fi
+done
+
+LLAVE_SSH="~/.ssh/id_rsa" # Update with the correct SSH key path
+CONEXION_SSH="ssh -i $LLAVE_SSH $DESTINO_SERVIDOR"
+
+# Show help if requested
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    echo "Usage: $0 <destination_ip> <container_file> [-f] [--exclude exclude_file]"
+    echo
+    echo "This script migrates LXC containers from the source server to the destination server."
+    echo "It assumes SSH connectivity is pre-configured using an SSH key."
+    echo
+    echo "Parameters:"
+    echo "  <destination_ip>: IP or hostname of the destination server."
+    echo "  <container_file>: File containing the container names to migrate, one per line."
+    echo
+    echo "Options:"
+    echo "  -f: Continue even if the container is already stopped."
+    echo "  --exclude: File listing directories to exclude during rsync."
+    echo "  -h, --help: Displays this help message."
+    exit 0
+fi
+
+if [[ -z "$DESTINO_SERVIDOR" || -z "$FICHERO_CONTENEDORES" ]]; then
+    echo "Usage: $0 <destination_ip> <container_file> [-f] [--exclude exclude_file]" >&2
+    exit 1
+fi
+
+if [[ ! -f "$FICHERO_CONTENEDORES" ]]; then
+    echo "Error: The file $FICHERO_CONTENEDORES does not exist." >&2
+    exit 1
+fi
+
+EXCLUDE_OPTIONS=""
+if [[ -n "$EXCLUDE_FILE" && -f "$EXCLUDE_FILE" ]]; then
+    while read -r EXCLUDE_DIR; do
+        [[ -n "$EXCLUDE_DIR" ]] && EXCLUDE_OPTIONS+=" --exclude=$EXCLUDE_DIR"
+    done < "$EXCLUDE_FILE"
+fi
+
+while read -r CONTENEDOR; do
+    if [[ -z "$CONTENEDOR" ]]; then
+        continue
+    fi
+
+    # Stop the container on the source server
+    echo "Stopping container $CONTENEDOR on the source server..."
+    if ! lxc-stop -n "$CONTENEDOR" 2>/dev/null; then
+        if $FORCE_CONTINUE; then
+            echo "Warning: Container $CONTENEDOR is already stopped. Continuing..."
+        else
+            echo "Error: Failed to stop container $CONTENEDOR on the source server." >&2
+            continue
+        fi
+    fi
+
+    echo "Connecting to the destination server and transferring the container..."
+    rsync -avhH --progress --numeric-ids $EXCLUDE_OPTIONS -e "ssh -i $LLAVE_SSH" "/var/lib/lxc/$CONTENEDOR" "$DESTINO_SERVIDOR:/var/lib/lxc/" || {
+        echo "Error: Failed to transfer container $CONTENEDOR to the destination server." >&2
+        continue
+    }
+
+    while true; do
+        # Calculate checksum on source
+        ORIGEN_CHECKSUM=$(du -sb "/var/lib/lxc/$CONTENEDOR" | awk '{print $1}')
+
+        # Calculate checksum on destination
+        DESTINO_CHECKSUM=$($CONEXION_SSH "du -sb /var/lib/lxc/$CONTENEDOR" | awk '{print $1}')
+
+        # Verify checksum
+        if [[ "$ORIGEN_CHECKSUM" -ne "$DESTINO_CHECKSUM" ]]; then
+            echo "Error: Transferred data for container $CONTENEDOR does not match. Retrying transfer..." >&2
+            $CONEXION_SSH "sudo rm -rf /var/lib/lxc/$CONTENEDOR" || {
+                echo "Error: Failed to clean up destination folder." >&2
+                break
+            }
+            rsync -avhH --progress --numeric-ids $EXCLUDE_OPTIONS -e "ssh -i $LLAVE_SSH" "/var/lib/lxc/$CONTENEDOR" "$DESTINO_SERVIDOR:/var/lib/lxc/" || {
+                echo "Error: Failed to retransmit container $CONTENEDOR." >&2
+                break
+            }
+        else
+            break
+        fi
+    done
+
+    echo "Migration of container $CONTENEDOR completed successfully."
+done < "$FICHERO_CONTENEDORES"
+
+echo "Migration completed for all containers in the file $FICHERO_CONTENEDORES."
