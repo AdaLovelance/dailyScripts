@@ -13,20 +13,26 @@
 # 6. Cleans up temporary data on the destination server.
 #
 # USAGE:
-#   $0 <destination_ip> <container_file>
+#   $0 <destination_ip> <container_file> [-f]
 # Where:
 #   - <destination_ip>: IP or hostname of the destination server.
 #   - <container_file>: File containing the container names, one per line.
+#   - -f: Optional flag to continue even if the container is already stopped.
 
 # Configurable variables
 DESTINO_SERVIDOR="$1"
 FICHERO_CONTENEDORES="$2"
+FORCE_CONTINUE=false
+if [[ "$3" == "-f" ]]; then
+    FORCE_CONTINUE=true
+fi
+
 LLAVE_SSH="~/.ssh/id_rsa" # Update with the correct SSH key path
 CONEXION_SSH="ssh -i $LLAVE_SSH $DESTINO_SERVIDOR"
 
 # Show help if requested
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    echo "Usage: $0 <destination_ip> <container_file>"
+    echo "Usage: $0 <destination_ip> <container_file> [-f]"
     echo
     echo "This script migrates LXC containers from the source server to the destination server."
     echo "It assumes SSH connectivity is pre-configured using an SSH key."
@@ -36,12 +42,13 @@ if [[ "$1" == "-h" || "$1" == "--help" ]]; then
     echo "  <container_file>: File containing the container names to migrate, one per line."
     echo
     echo "Options:"
+    echo "  -f: Continue even if the container is already stopped."
     echo "  -h, --help: Displays this help message."
     exit 0
 fi
 
 if [[ -z "$DESTINO_SERVIDOR" || -z "$FICHERO_CONTENEDORES" ]]; then
-    echo "Usage: $0 <destination_ip> <container_file>" >&2
+    echo "Usage: $0 <destination_ip> <container_file> [-f]" >&2
     exit 1
 fi
 
@@ -57,10 +64,14 @@ while read -r CONTENEDOR; do
 
     # Stop the container on the source server
     echo "Stopping container $CONTENEDOR on the source server..."
-    lxc-stop -n "$CONTENEDOR" || {
-        echo "Error: Failed to stop container $CONTENEDOR on the source server." >&2
-        continue
-    }
+    if ! lxc-stop -n "$CONTENEDOR" 2>/dev/null; then
+        if $FORCE_CONTINUE; then
+            echo "Warning: Container $CONTENEDOR is already stopped. Continuing..."
+        else
+            echo "Error: Failed to stop container $CONTENEDOR on the source server." >&2
+            continue
+        fi
+    fi
 
     echo "Connecting to the destination server and transferring the container..."
     rsync -aHAX --numeric-ids --progress -e "ssh -i $LLAVE_SSH" "/var/lib/lxc/$CONTENEDOR" "$DESTINO_SERVIDOR:/tmp/$CONTENEDOR" || {
@@ -115,3 +126,4 @@ while read -r CONTENEDOR; do
 done < "$FICHERO_CONTENEDORES"
 
 echo "Migration completed for all containers in the file $FICHERO_CONTENEDORES."
+
